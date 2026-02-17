@@ -163,14 +163,6 @@ Click on the **"Variables & Secrets"** tab under container settings:
 **Optional Environment Variables:**
 - `PORT`: Port to listen on (defaults to 8080, should match container port)
 
-**Example Configuration:**
-```
-REDIS_HOST=your-redis-host
-REDIS_PORT=your-redis-port
-REDIS_PASSWORD=your-redis-password
-GCP_FUNCTION_URL=https://your-function-name-xxxxx.us-central1.run.app
-```
-
 #### 6. Configure Resource Limits (Optional)
 
 Click on the **"Settings"** tab:
