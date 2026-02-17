@@ -323,7 +323,3 @@ When you deploy a new revision:
 6. There may be a brief gap (seconds) during the transition where expired keys are not processed
 
 **Best Practice:** Deploy during low-traffic periods to minimize missed expiration events during the transition.
-
-## License
-
-[Add your license here]
