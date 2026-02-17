@@ -69,7 +69,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"Listening for Redis events")
+            self.wfile.write(b"Listening for Redis events\n")
         else:
             self.send_response(404)
             self.end_headers()
