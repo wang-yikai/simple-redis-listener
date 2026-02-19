@@ -45,6 +45,7 @@ export REDIS_HOST=your-redis-host
 export REDIS_PORT=6379
 export REDIS_PASSWORD=your-redis-password  # Optional
 export GCP_FUNCTION_URL=https://your-function-url.run.app
+export ON_KEY_EXPIRED_SECRET=your-secret-key  # Required - must match Firebase function's ON_KEY_EXPIRED_SECRET
 export PORT=8080  # Optional, defaults to 8080
 ```
 
@@ -67,6 +68,7 @@ docker run -p 8080:8080 \
   -e REDIS_PORT=6379 \
   -e REDIS_PASSWORD=your-redis-password \
   -e GCP_FUNCTION_URL=https://your-function-url.run.app \
+  -e ON_KEY_EXPIRED_SECRET=your-secret-key \
   redis-listener
 ```
 
@@ -159,6 +161,7 @@ Click on the **"Variables & Secrets"** tab under container settings:
 - `REDIS_PORT`: Redis port (e.g., `13492`)
 - `REDIS_PASSWORD`: Redis password (if required)
 - `GCP_FUNCTION_URL`: Full URL of your Cloud Function endpoint (e.g., `https://your-function-name-xxxxx.run.app`)
+- `ON_KEY_EXPIRED_SECRET`: Secret key that must match the `ON_KEY_EXPIRED_SECRET` parameter in your Firebase function. This is sent in the `x-on-key-expired-secret` header for authentication.
 
 **Optional Environment Variables:**
 - `PORT`: Port to listen on (defaults to 8080, should match container port)

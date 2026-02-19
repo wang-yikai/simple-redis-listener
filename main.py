@@ -1,7 +1,7 @@
 """
 Redis keyspace listener: subscribes to key expiration events and calls the
 GCP Cloud Function for each expired key.
-Requires: REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, GCP_FUNCTION_URL.
+Requires: REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, GCP_FUNCTION_URL, ON_KEY_EXPIRED_SECRET.
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ def listen_for_expirations(
     redis_port: int,
     redis_password: str | None,
     gcp_function_url: str,
+    on_key_expired_secret: str,
 ) -> None:
     redis_client = redis.Redis(
         host=redis_host,
@@ -54,6 +55,7 @@ def listen_for_expirations(
                 response = requests.post(
                     gcp_function_url,
                     json={"expired_key": expired_key},
+                    headers={"x-on-key-expired-secret": on_key_expired_secret},
                     timeout=30,
                 )
                 logger.info("Called function: %s", response.status_code)
@@ -105,6 +107,7 @@ if __name__ == "__main__":
     redis_password = os.getenv("REDIS_PASSWORD")
 
     gcp_function_url = _require_env("GCP_FUNCTION_URL")
+    on_key_expired_secret = _require_env("ON_KEY_EXPIRED_SECRET")
 
     logger.info("Starting Redis keyspace listener service")
 
@@ -118,4 +121,10 @@ if __name__ == "__main__":
     # Run Redis listener in main thread (this is the primary function)
     # This ensures the listener keeps running even if health check thread has issues
     logger.info("Starting Redis expiration listener...")
-    listen_for_expirations(redis_host, redis_port, redis_password, gcp_function_url)
+    listen_for_expirations(
+        redis_host,
+        redis_port,
+        redis_password,
+        gcp_function_url,
+        on_key_expired_secret,
+    )
