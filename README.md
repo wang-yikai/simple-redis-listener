@@ -307,21 +307,33 @@ The service uses a dual-threaded architecture:
    - Subscribes to Redis keyspace notifications (`__keyevent@0__:expired`)
    - Continuously listens for key expiration events
    - Calls the configured GCP Cloud Function when keys expire
+   - Automatically reconnects with exponential backoff if the Redis connection drops
    - This thread must remain running for the service to function
 
 2. **Daemon Thread (Secondary):** Runs a lightweight HTTP health check server
    - Listens on port 8080 for health check requests
    - Responds to `GET /` and `GET /health` endpoints
-   - Allows Cloud Run to monitor service health
-   - Runs as a daemon thread so it doesn't block shutdown
+   - Returns **200** when connected to Redis, **503** when disconnected
+   - Allows Cloud Run to monitor actual service health
+
+### Resilience & Reconnection
+
+The service is designed to run 24/7 and handles connection failures gracefully:
+
+- **Automatic reconnection:** If the Redis connection drops (network blip, Redis restart, timeout), the listener automatically reconnects with exponential backoff (1s → 2s → 4s → ... → 60s max)
+- **Connection health checks:** The Redis client sends periodic health-check pings (every 15s) to detect stale connections before they cause missed events
+- **Socket timeouts:** Connection and read timeouts prevent the listener from hanging indefinitely on a dead connection
+- **HTTP retries:** Calls to the GCP Cloud Function are retried up to 3 times on transient failures (429, 5xx) with backoff
+- **Graceful shutdown:** Handles SIGTERM/SIGINT signals so Cloud Run revision updates cleanly close the Redis subscription before the container exits
+- **Health-aware endpoint:** The `/health` endpoint returns 503 while Redis is disconnected, allowing Cloud Run to detect and respond to unhealthy instances
 
 ### Deployment and Revision Updates
 
 When you deploy a new revision:
 1. Cloud Run starts a new container instance with the updated code
 2. The old container receives a termination signal (SIGTERM)
-3. The old container has a grace period (default 10 seconds) to shut down gracefully
-4. The Redis listener thread in the old container stops when the container terminates
+3. The service catches SIGTERM and cleanly unsubscribes from Redis
+4. The old container has a grace period (default 10 seconds) to shut down gracefully
 5. The new container starts fresh with the new code and new threads
 6. There may be a brief gap (seconds) during the transition where expired keys are not processed
 

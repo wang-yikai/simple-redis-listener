@@ -1,27 +1,64 @@
 """
 Redis keyspace listener: subscribes to key expiration events and calls the
 GCP Cloud Function for each expired key.
-Requires: REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, GCP_FUNCTION_URL, ON_KEY_EXPIRED_SECRET.
+
+Architecture:
+  - Main thread: runs the Redis pub/sub listener (with auto-reconnect).
+  - Daemon thread: lightweight HTTP health-check server for Cloud Run.
+
+Requires env vars:
+  REDIS_HOST, REDIS_PORT, REDIS_PASSWORD (optional),
+  GCP_FUNCTION_URL, ON_KEY_EXPIRED_SECRET.
 """
 from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread
+from threading import Event, Thread
 
 import google.cloud.logging  # type: ignore
 import redis  # type: ignore
 import requests  # type: ignore
+from requests.adapters import HTTPAdapter  # type: ignore
+from urllib3.util.retry import Retry  # type: ignore
 
-# Initialize Google Cloud Logging
+# ---------------------------------------------------------------------------
+# Logging — routes all output through Google Cloud Logging
+# ---------------------------------------------------------------------------
 client = google.cloud.logging.Client()
 client.setup_logging()
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Tunable constants
+# ---------------------------------------------------------------------------
+RECONNECT_BASE_DELAY = 1        # Initial retry delay (seconds) after a Redis disconnect
+RECONNECT_MAX_DELAY = 60        # Cap for exponential backoff (seconds)
+GCP_CALL_RETRIES = 3            # Number of automatic retries for the Cloud Function call
+GCP_CALL_BACKOFF_FACTOR = 0.5   # urllib3 backoff factor between retries (0.5 → 0.5s, 1s, 2s)
+GCP_CALL_TIMEOUT = 30           # Per-request timeout for the Cloud Function call (seconds)
+REDIS_SOCKET_TIMEOUT = 30       # Timeout on blocking Redis read operations (seconds)
+REDIS_SOCKET_CONNECT_TIMEOUT = 10  # Timeout for the initial TCP connection to Redis (seconds)
+REDIS_HEALTH_CHECK_INTERVAL = 15   # How often redis-py sends a PING to detect stale connections (seconds)
 
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+# Set by signal handlers (SIGTERM / SIGINT) to break the listener loop cleanly
+shutdown_event = Event()
+# Tracks whether the listener currently has an active Redis connection.
+# Read by the health-check handler to return 200 vs 503.
+redis_connected = False
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def _require_env(name: str) -> str:
+    """Return an env var's value or exit immediately if it's missing."""
     value = os.getenv(name)
     if not value:
         logger.error("Missing required env: %s", name)
@@ -29,6 +66,57 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _parse_int_env(name: str, value: str) -> int:
+    """Parse a string as an integer or exit with a clear error message."""
+    try:
+        return int(value)
+    except ValueError:
+        logger.error("%s must be a valid integer, got: %s", name, value)
+        sys.exit(1)
+
+
+def _build_http_session() -> requests.Session:
+    """
+    Build a requests Session with automatic retry on transient failures.
+
+    Retries on 429 (rate-limit) and 5xx server errors with exponential backoff
+    so a momentary Cloud Function hiccup doesn't lose the event.
+    """
+    session = requests.Session()
+    retries = Retry(
+        total=GCP_CALL_RETRIES,
+        backoff_factor=GCP_CALL_BACKOFF_FACTOR,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _handle_expired_key(
+    session: requests.Session,
+    expired_key: str,
+    gcp_function_url: str,
+    on_key_expired_secret: str,
+) -> None:
+    """POST the expired key to the GCP Cloud Function (with built-in retries)."""
+    try:
+        response = session.post(
+            gcp_function_url,
+            json={"expired_key": expired_key},
+            headers={"x-on-key-expired-secret": on_key_expired_secret},
+            timeout=GCP_CALL_TIMEOUT,
+        )
+        logger.info("Called function for key '%s': %s", expired_key, response.status_code)
+    except requests.RequestException as exc:
+        logger.error("Error calling GCP function for key '%s': %s", expired_key, exc)
+
+
+# ---------------------------------------------------------------------------
+# Core listener — runs in the main thread
+# ---------------------------------------------------------------------------
 def listen_for_expirations(
     redis_host: str,
     redis_port: int,
@@ -36,90 +124,170 @@ def listen_for_expirations(
     gcp_function_url: str,
     on_key_expired_secret: str,
 ) -> None:
-    redis_client = redis.Redis(
-        host=redis_host,
-        port=redis_port,
-        password=redis_password,
-        decode_responses=True,
-    )
-    pubsub = redis_client.pubsub()
-    pubsub.psubscribe("__keyevent@0__:expired")
+    """
+    Subscribe to Redis keyspace expiration events and forward them to the
+    Cloud Function. Automatically reconnects with exponential backoff if the
+    connection drops (network blip, Redis restart, idle timeout, etc.).
+    """
+    global redis_connected
+    session = _build_http_session()
+    delay = RECONNECT_BASE_DELAY
 
-    logger.info("Listening for expired keys...")
-    for message in pubsub.listen():
-        if message["type"] == "pmessage":
-            expired_key: str = message["data"]
-            logger.info("Key expired: %s", expired_key)
+    # Outer loop: keeps reconnecting until a shutdown signal is received
+    while not shutdown_event.is_set():
+        pubsub = None
+        redis_client = None
+        try:
+            # --- Connect ---------------------------------------------------
+            redis_client = redis.Redis(
+                host=redis_host,
+                port=redis_port,
+                password=redis_password,
+                decode_responses=True,
+                socket_timeout=REDIS_SOCKET_TIMEOUT,
+                socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT,
+                # Periodically PINGs Redis so stale connections are detected
+                # before a real message is missed
+                health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
+                retry_on_timeout=True,
+            )
+            # Verify the connection is actually alive before subscribing
+            redis_client.ping()
+            redis_connected = True
+            delay = RECONNECT_BASE_DELAY  # Reset backoff on successful connect
+            logger.info("Connected to Redis at %s:%s", redis_host, redis_port)
 
-            try:
-                response = requests.post(
-                    gcp_function_url,
-                    json={"expired_key": expired_key},
-                    headers={"x-on-key-expired-secret": on_key_expired_secret},
-                    timeout=30,
-                )
-                logger.info("Called function: %s", response.status_code)
-            except requests.RequestException as exc:
-                logger.error("Error calling GCP function: %s", exc)
+            # --- Subscribe -------------------------------------------------
+            pubsub = redis_client.pubsub()
+            # __keyevent@0__:expired fires for every key that expires in DB 0.
+            # Requires Redis to have notify-keyspace-events set to include "Ex".
+            pubsub.psubscribe("__keyevent@0__:expired")
+            logger.info("Subscribed — listening for expired keys...")
+
+            # --- Listen (blocks until disconnect or shutdown) --------------
+            for message in pubsub.listen():
+                if shutdown_event.is_set():
+                    break
+                # pubsub.listen() yields subscribe confirmations, pongs, etc.
+                # We only care about actual pattern-matched messages.
+                if message["type"] == "pmessage":
+                    expired_key: str = message["data"]
+                    logger.info("Key expired: %s", expired_key)
+                    _handle_expired_key(
+                        session, expired_key, gcp_function_url, on_key_expired_secret
+                    )
+
+        except (redis.ConnectionError, redis.TimeoutError, OSError) as exc:
+            redis_connected = False
+            logger.warning("Redis connection lost: %s — retrying in %ss", exc, delay)
+        except Exception as exc:
+            redis_connected = False
+            logger.exception("Unexpected error in listener: %s", exc)
+        finally:
+            # Always clean up the subscription and connection so we don't leak
+            # file descriptors across reconnection cycles
+            if pubsub:
+                try:
+                    pubsub.punsubscribe()
+                    pubsub.close()
+                except Exception:
+                    pass
+            if redis_client:
+                try:
+                    redis_client.close()
+                except Exception:
+                    pass
+
+        # --- Back off before reconnecting ----------------------------------
+        if not shutdown_event.is_set():
+            # .wait() returns immediately if the event is set (i.e. shutdown),
+            # otherwise sleeps for `delay` seconds — avoids tight-looping.
+            shutdown_event.wait(delay)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+
+    redis_connected = False
+    logger.info("Listener stopped")
 
 
+# ---------------------------------------------------------------------------
+# Health-check HTTP server — runs in a daemon thread
+# ---------------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler for health checks."""
+    """
+    Minimal HTTP handler for Cloud Run health checks.
+    Returns 200 when Redis is connected, 503 when it isn't, so Cloud Run
+    can detect and respond to unhealthy instances.
+    """
 
     def do_GET(self):
         if self.path == "/" or self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Listening for Redis events\n")
+            if redis_connected:
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK — connected to Redis\n")
+            else:
+                self.send_response(503)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"UNHEALTHY — Redis disconnected\n")
         else:
             self.send_response(404)
             self.end_headers()
 
     def log_message(self, _format, *args):
-        """Suppress default HTTP server logging."""
-        # Suppress default HTTP server logging - we use Cloud Logging instead
-        # Parameter name uses underscore prefix to indicate intentionally unused
+        # Suppress default stderr logging — we use Cloud Logging instead
+        pass
 
 
 def run_health_server(server_port: int) -> None:
-    """Run a simple HTTP server for health checks."""
+    """Start a blocking HTTP server that serves health-check responses."""
     server = HTTPServer(("0.0.0.0", server_port), HealthCheckHandler)
     logger.info("Health check server started on port %s", server_port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Health check server shutting down")
+        pass
+    finally:
         server.shutdown()
+        logger.info("Health check server stopped")
 
 
+# ---------------------------------------------------------------------------
+# Signal handling — lets Cloud Run (SIGTERM) and Ctrl-C (SIGINT) trigger a
+# clean shutdown instead of an abrupt kill.
+# ---------------------------------------------------------------------------
+def _shutdown_handler(signum, _frame):
+    sig_name = signal.Signals(signum).name
+    logger.info("Received %s — shutting down gracefully", sig_name)
+    shutdown_event.set()
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Validate all required environment variables upfront
+    # Register signal handlers before doing anything else so we can catch
+    # signals even during startup
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
+    # Validate required environment variables upfront — fail fast
     redis_host = _require_env("REDIS_HOST")
-    redis_port_str = _require_env("REDIS_PORT")
-    try:
-        redis_port = int(redis_port_str)
-    except ValueError:
-        logger.error("REDIS_PORT must be a valid integer, got: %s", redis_port_str)
-        sys.exit(1)
-
-    # Optional - some Redis instances don't require passwords
-    redis_password = os.getenv("REDIS_PASSWORD")
-
+    redis_port = _parse_int_env("REDIS_PORT", _require_env("REDIS_PORT"))
+    redis_password = os.getenv("REDIS_PASSWORD")  # Optional — some Redis instances have no auth
     gcp_function_url = _require_env("GCP_FUNCTION_URL")
     on_key_expired_secret = _require_env("ON_KEY_EXPIRED_SECRET")
+    port = _parse_int_env("PORT", os.getenv("PORT", "8080"))
 
     logger.info("Starting Redis keyspace listener service")
 
-    port = int(os.getenv("PORT", "8080"))
-
-    # Start health check server in a daemon thread
-    # This allows Cloud Run to keep the container alive via health checks
+    # Health-check server runs in a daemon thread so it doesn't prevent shutdown
     health_thread = Thread(target=run_health_server, args=(port,), daemon=True)
     health_thread.start()
 
-    # Run Redis listener in main thread (this is the primary function)
-    # This ensures the listener keeps running even if health check thread has issues
+    # The Redis listener runs in the main thread — this is intentional:
+    # if the listener crashes, the process exits and Cloud Run restarts it.
     logger.info("Starting Redis expiration listener...")
     listen_for_expirations(
         redis_host,
@@ -128,3 +296,4 @@ if __name__ == "__main__":
         gcp_function_url,
         on_key_expired_secret,
     )
+    logger.info("Service shut down")
