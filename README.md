@@ -40,7 +40,7 @@ pip install -r requirements.txt
 
 ### 4. Configure Systemd Service
 ```bash
-sudo nano /etc/systemd/system/redis-listener.service
+sudo vim /etc/systemd/system/redis-listener.service
 ```
 
 Paste this configuration (replace `YOUR_USERNAME` and environment values):
