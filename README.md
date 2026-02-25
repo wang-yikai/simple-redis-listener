@@ -25,7 +25,7 @@ gcloud compute instances create redis-listener \
 gcloud compute ssh redis-listener --zone=us-central1-a
 
 # Install dependencies
-sudo apt update && sudo apt install -y python3-pip python3-venv git
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git
 
 # Clone repository
 cd /home/$USER
