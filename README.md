@@ -1,340 +1,213 @@
 # simple-redis-listener
 
-A Redis keyspace listener service that subscribes to key expiration events and calls a Google Cloud Function when keys expire. Deployed on Google Cloud Run for cost-effective, serverless operation.
+A lightweight Redis keyspace listener that monitors key expirations and triggers Google Cloud Functions. Runs on Google Compute Engine for reliable 24/7 operation.
 
-## Overview
+## Quick Deploy
 
-This service listens for Redis key expiration events using Redis keyspace notifications and automatically triggers a GCP Cloud Function for each expired key. It's designed to run continuously as a lightweight containerized service.
-
-**Architecture:**
-- The Redis listener runs in the main thread (primary function) to ensure continuous operation
-- A lightweight HTTP health check server runs in a daemon thread on port 8080 for Cloud Run health checks
-- This design ensures the Redis listener keeps running even if the health check thread has issues
-
-## Prerequisites
-
-- Google Cloud Platform account
-- Redis instance (can be Google Cloud Memorystore, Redis Cloud, or self-hosted)
-- GCP Cloud Function endpoint URL
-- Docker (for local testing, optional)
-
-## Local Development
-
-### Setup
-
-1. Clone the repository:
+### 1. Enable Redis Keyspace Notifications
 ```bash
-git clone <repository-url>
-cd simple-redis-listener
-```
-
-2. Create a virtual environment:
-```bash
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-4. Set environment variables:
-```bash
-export REDIS_HOST=your-redis-host
-export REDIS_PORT=6379
-export REDIS_PASSWORD=your-redis-password  # Optional
-export GCP_FUNCTION_URL=https://your-function-url.run.app
-export ON_KEY_EXPIRED_SECRET=your-secret-key  # Required - must match Firebase function's ON_KEY_EXPIRED_SECRET
-export PORT=8080  # Optional, defaults to 8080
-```
-
-5. Run the service:
-```bash
-python main.py
-```
-
-### Testing Locally with Docker
-
-1. Build the Docker image:
-```bash
-docker build -t redis-listener .
-```
-
-2. Run the container:
-```bash
-docker run -p 8080:8080 \
-  -e REDIS_HOST=your-redis-host \
-  -e REDIS_PORT=6379 \
-  -e REDIS_PASSWORD=your-redis-password \
-  -e GCP_FUNCTION_URL=https://your-function-url.run.app \
-  -e ON_KEY_EXPIRED_SECRET=your-secret-key \
-  redis-listener
-```
-
-## Google Cloud Run Deployment
-
-### Cost Considerations
-
-**Free Tier (Monthly):**
-- 180,000 vCPU-seconds
-- 360,000 GiB-seconds
-- 2 million requests
-
-**Recommended Configuration:**
-- **Billing:** Request-based (charged only when processing requests, CPU limited outside requests)
-- **Minimum instances:** **1** (required - see important note below)
-- **Maximum instances:** Leave empty or set based on expected load
-- **CPU:** 1 vCPU (default, sufficient for Redis pub/sub)
-- **Memory:** 512 MiB (default, can be reduced to 256 MiB if needed)
-
-**⚠️ Important:** The Redis listener must run continuously to process expiration events. Setting minimum instances to 0 will cause the service to scale to zero when idle, which means:
-- The Redis listener will stop running
-- Expired keys will NOT be processed until a request wakes the service
-- This defeats the purpose of the listener
-
-**Therefore, you MUST set minimum instances to 1** to keep the Redis listener running continuously. This will incur continuous costs (approximately $0.00002400 per vCPU-second and $0.00000250 per GiB-second), but it's necessary for the service to function correctly.
-
-### Step-by-Step Deployment via Google Cloud Console
-
-#### 1. Enable Required APIs
-
-1. Navigate to [APIs & Services](https://console.cloud.google.com/apis/library)
-2. Enable the following APIs:
-   - Cloud Run API
-   - Cloud Build API
-   - Cloud Logging API
-
-#### 2. Navigate to Cloud Run
-
-1. Go to [Cloud Run Console](https://console.cloud.google.com/run)
-2. Click **"Create service"**
-
-#### 3. Configure Service Settings
-
-**Authentication:**
-- Select **"Allow public access"** (for now, to allow health checks and simplify access)
-  - The health endpoint (`/` or `/health`) will be publicly accessible
-  - You can change this later if you need to restrict access
-- Alternatively, if you prefer authentication:
-  - Select **"Require authentication"**
-  - Check **"Identity and Access Management (IAM)"** (for service-to-service communication)
-  - Do NOT check "Identity Aware Proxy (IAP)" (not needed for this service)
-
-**Billing:**
-- Select **"Request-based"** (charged only when processing requests, CPU limited outside requests)
-
-**Service Scaling:**
-- Select **"Auto scaling"**
-- **Minimum number of instances:** **`1`** (required - the Redis listener must run continuously)
-- **Maximum number of instances:** Leave empty or set based on expected load
-- **⚠️ Important:** Do NOT set minimum to 0. The Redis listener needs to be running continuously to process expiration events. If the service scales to zero, expired keys will not be processed.
-
-**Ingress:**
-- Select **"All"** (Allow direct access to your service from the internet)
-  - This allows the service to connect to external Redis instances and call Cloud Functions
-
-**Container Configuration:**
-- **Container port:** `8080`
-- **Note:** The service listens on the `$PORT` environment variable (defaults to 8080)
-
-#### 4. Configure Container Source
-
-In the **"Containers"** tab:
-
-1. **Source repository:** Click "Select" and choose your source:
-   - If using Cloud Source Repositories: Select your repository
-   - If using GitHub: Connect your repository
-   - If using a container image: Select "Deploy one revision from an existing container image" and provide the image URL
-
-2. **Cloud Build trigger:** A Cloud Build trigger will be created automatically to build and deploy your code
-
-3. **Container port:** Set to `8080`
-   - Note: The service listens on the `$PORT` environment variable (defaults to 8080)
-
-#### 5. Set Environment Variables
-
-Click on the **"Variables & Secrets"** tab under container settings:
-
-**Required Environment Variables:**
-- `REDIS_HOST`: Your Redis host (e.g., `redis-13492.c238.us-central1-2.gce.cloud.redislabs.com`)
-- `REDIS_PORT`: Redis port (e.g., `13492`)
-- `REDIS_PASSWORD`: Redis password (if required)
-- `GCP_FUNCTION_URL`: Full URL of your Cloud Function endpoint (e.g., `https://your-function-name-xxxxx.run.app`)
-- `ON_KEY_EXPIRED_SECRET`: Secret key that must match the `ON_KEY_EXPIRED_SECRET` parameter in your Firebase function. This is sent in the `x-on-key-expired-secret` header for authentication.
-
-**Optional Environment Variables:**
-- `PORT`: Port to listen on (defaults to 8080, should match container port)
-
-#### 6. Configure Resource Limits (Optional)
-
-Click on the **"Settings"** tab:
-- **CPU:** 1 vCPU (default, sufficient for Redis pub/sub)
-- **Memory:** 512 MiB (default, can be reduced to 256 MiB for cost savings)
-- **Timeout:** 300 seconds (default, adjust if needed)
-- **Concurrency:** 80 (default, adjust based on load)
-
-#### 7. Deploy
-
-Click **"Create"** at the bottom of the page to deploy the service.
-
-### Post-Deployment
-
-1. **Get the Service URL:**
-   - After deployment, you'll see the service URL displayed (e.g., `https://redis-listener-xxxxx.us-central1.run.app`)
-   - You can also find it in the Cloud Run service list by clicking on your service name
-
-2. **Test the Health Endpoint:**
-   - The service URL is shown at the top of the service details page
-   - You can test it by visiting the URL in your browser or using a tool like `curl`
-   - Example: `https://your-service-url.run.app/` should return "Listening for Redis events"
-
-3. **Check Logs:**
-   - Navigate to your service in the Cloud Run console
-   - Click on the **"Logs"** tab to view real-time logs
-   - Logs are automatically sent to Google Cloud Logging
-
-### IAM Permissions
-
-The service needs permissions to:
-- Write logs to Cloud Logging (automatically granted to Cloud Run services)
-- Call your Cloud Function (you need to grant the Cloud Run service account permission to invoke your Cloud Function)
-
-**Grant Cloud Function Invocation Permission via Console:**
-
-1. Navigate to your Cloud Function in the [Cloud Functions Console](https://console.cloud.google.com/functions)
-2. Click on your function name
-3. Go to the **"Permissions"** tab
-4. Click **"Add Principal"**
-5. In the "New principals" field, enter the Cloud Run service account:
-   - Format: `PROJECT_NUMBER-compute@developer.gserviceaccount.com`
-   - To find your project number: Go to [Project Settings](https://console.cloud.google.com/iam-admin/settings) and look for "Project number"
-6. Select the role: **"Cloud Functions Invoker"**
-7. Click **"Save"**
-
-**Alternative: Find the Service Account from Cloud Run:**
-1. In your Cloud Run service, go to the **"Security"** tab
-2. Look for "Service account" - this shows the service account being used
-3. Use this service account email when granting permissions to your Cloud Function
-
-## Redis Configuration
-
-Your Redis instance must have keyspace notifications enabled:
-
-```bash
-# Enable keyspace notifications for expired keys
 redis-cli CONFIG SET notify-keyspace-events Ex
 ```
 
-Or add to your Redis configuration file:
+### 2. Create Compute Engine VM
+```bash
+gcloud compute instances create redis-listener \
+  --machine-type=e2-micro \
+  --zone=us-central1-a \
+  --image-family=debian-12 \
+  --image-project=debian-cloud \
+  --scopes=cloud-platform
 ```
-notify-keyspace-events Ex
+
+### 3. SSH and Install
+```bash
+# SSH into VM
+gcloud compute ssh redis-listener --zone=us-central1-a
+
+# Install dependencies
+sudo apt update && sudo apt install -y python3-pip python3-venv git
+
+# Clone repository
+cd /home/$USER
+git clone https://github.com/wang-yikai/simple-redis-listener.git
+cd simple-redis-listener
+
+# Setup virtual environment
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## Monitoring
+### 4. Configure Systemd Service
+```bash
+sudo nano /etc/systemd/system/redis-listener.service
+```
 
-### View Logs
+Paste this configuration (replace `YOUR_USERNAME` and environment values):
+```ini
+[Unit]
+Description=Redis Keyspace Listener
+After=network.target
 
-All logs are automatically sent to Google Cloud Logging. View them via:
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/simple-redis-listener
+Environment="REDIS_HOST=your-redis-host.com"
+Environment="REDIS_PORT=6379"
+Environment="REDIS_PASSWORD=your-password"
+Environment="GCP_FUNCTION_URL=https://your-function-url.cloudfunctions.net/function"
+Environment="ON_KEY_EXPIRED_SECRET=your-secret-key"
+ExecStart=/home/YOUR_USERNAME/simple-redis-listener/venv/bin/python /home/YOUR_USERNAME/simple-redis-listener/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
-1. **Cloud Run Console:**
-   - Navigate to [Cloud Run](https://console.cloud.google.com/run)
-   - Click on your service name
-   - Click on the **"Logs"** tab to view real-time logs
+[Install]
+WantedBy=multi-user.target
+```
 
-2. **Cloud Logging Console:**
-   - Navigate to [Cloud Logging](https://console.cloud.google.com/logs)
-   - Filter by resource type: `cloud_run_revision`
-   - Filter by service name: Your service name
+**Replace:**
+- `YOUR_USERNAME` - Run `whoami` to find your username
+- `REDIS_HOST` - Your Redis hostname
+- `REDIS_PORT` - Your Redis port (usually 6379)
+- `REDIS_PASSWORD` - Your Redis password (remove line or set to empty string if no auth)
+- `GCP_FUNCTION_URL` - Your Cloud Function URL
+- `ON_KEY_EXPIRED_SECRET` - Secret key for function authentication
 
-### Key Metrics to Monitor
+### 5. Start the Service
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable redis-listener
+sudo systemctl start redis-listener
 
-- **Request count:** Number of expired keys processed
-- **Error rate:** Failed Cloud Function calls
-- **Latency:** Time to process expired keys
-- **Instance count:** Number of running instances (should stay at 1 for continuous operation)
-- **Redis connection status:** Check logs to ensure Redis connection is maintained
+# Check status
+sudo systemctl status redis-listener
 
-### Set Up Alerts
+# View logs
+sudo journalctl -u redis-listener -f
+```
 
-Create alerts in Cloud Monitoring for:
-- High error rates
-- Service unavailability
-- Unusual request patterns
+### 6. Test It Works
+```bash
+# Set a key that expires in 5 seconds
+redis-cli -h YOUR_REDIS_HOST -p YOUR_REDIS_PORT -a YOUR_PASSWORD SET test:expire "value" EX 5
+
+# Watch logs - you should see:
+# "Key expired: test:expire"
+# "Called function for key 'test:expire': 200"
+```
+
+Done! ✅
+
+---
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `REDIS_HOST` | Yes | Redis server hostname |
+| `REDIS_PORT` | Yes | Redis server port |
+| `REDIS_PASSWORD` | No | Redis password (if auth enabled) |
+| `GCP_FUNCTION_URL` | Yes | Cloud Function endpoint URL |
+| `ON_KEY_EXPIRED_SECRET` | Yes | Secret for authenticating with Cloud Function |
+
+---
+
+## Management
+```bash
+# View logs
+sudo journalctl -u redis-listener -f
+
+# Restart service
+sudo systemctl restart redis-listener
+
+# Stop service
+sudo systemctl stop redis-listener
+
+# Start service
+sudo systemctl start redis-listener
+```
+
+---
+
+## How It Works
+
+1. Redis expires a key (e.g., `SET session:abc "data" EX 3600`)
+2. Redis publishes to `__keyevent@0__:expired` channel
+3. Listener receives the event and calls your Cloud Function
+4. Cloud Function processes the expiration (cleanup, notifications, etc.)
+
+**Architecture:**
+```
+Redis → pub/sub → Compute Engine VM → HTTPS → Cloud Function
+```
+
+---
 
 ## Troubleshooting
 
-### Service Not Starting
+### Not receiving expiration events?
+```bash
+# Check Redis keyspace notifications are enabled
+redis-cli CONFIG GET notify-keyspace-events
+# Should include "Ex"
 
-1. Check logs for missing environment variables
-2. Verify Redis connection (check REDIS_HOST, REDIS_PORT, REDIS_PASSWORD)
-3. Ensure Redis keyspace notifications are enabled
-
-### Not Receiving Expiration Events
-
-1. Verify Redis configuration: `CONFIG GET notify-keyspace-events` should include `Ex`
-2. Check Redis connection logs
-3. Verify the service is running and connected to Redis
-
-### Cloud Function Not Being Called
-
-1. Check GCP_FUNCTION_URL is correct
-2. Verify IAM permissions for Cloud Function invocation
-3. Check Cloud Function logs for errors
-4. Verify network connectivity (service can reach Cloud Function)
-
-### High Costs
-
-1. Review instance count (should be 1 for continuous operation)
-2. Verify minimum instances is set to 1 (required for Redis listener to work)
-3. Verify request-based billing is enabled
-4. Monitor vCPU-seconds and GiB-seconds usage
-5. Consider reducing memory allocation if possible (e.g., from 512 MiB to 256 MiB)
-
-**Note:** With minimum instances = 1, you will incur continuous costs. This is necessary for the Redis listener to function. Estimated monthly cost for 1 vCPU + 512 MiB running 24/7: approximately $62-65/month (varies by region).
-
-## Architecture
-
-```
-Redis Instance → Redis Keyspace Notifications → Cloud Run Service → GCP Cloud Function
+# Check listener is connected
+sudo journalctl -u redis-listener | grep "Connected to Redis"
 ```
 
-### Service Architecture
+### Cloud Function not being called?
+```bash
+# Test function directly
+curl -X POST $GCP_FUNCTION_URL \
+  -H "x-on-key-expired-secret: $ON_KEY_EXPIRED_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"expired_key": "test:key"}'
 
-The service uses a dual-threaded architecture:
+# Grant VM permission to invoke function
+# For 1st-gen Cloud Functions:
+gcloud functions add-iam-policy-binding YOUR_FUNCTION_NAME \
+  --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+  --role="roles/cloudfunctions.invoker"
 
-1. **Main Thread (Primary):** Runs the Redis expiration listener
-   - Subscribes to Redis keyspace notifications (`__keyevent@0__:expired`)
-   - Continuously listens for key expiration events
-   - Calls the configured GCP Cloud Function when keys expire
-   - Automatically reconnects with exponential backoff if the Redis connection drops
-   - This thread must remain running for the service to function
+# For 2nd-gen Cloud Functions (Cloud Run based):
+gcloud run services add-iam-policy-binding YOUR_SERVICE_NAME \
+  --region=YOUR_REGION \
+  --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+  --role="roles/run.invoker"
+```
 
-2. **Daemon Thread (Secondary):** Runs a lightweight HTTP health check server
-   - Listens on port 8080 for health check requests
-   - Responds to `GET /` and `GET /health` endpoints
-   - Returns **200** when connected to Redis, **503** when disconnected
-   - Allows Cloud Run to monitor actual service health
+### Service won't start?
+```bash
+# Check logs for errors
+sudo journalctl -u redis-listener -n 50
 
-### Resilience & Reconnection
+# Verify file paths in service file
+ls -la /home/$USER/simple-redis-listener/main.py
+ls -la /home/$USER/simple-redis-listener/venv/bin/python
+```
 
-The service is designed to run 24/7 and handles connection failures gracefully:
+---
 
-- **Automatic reconnection:** If the Redis connection drops (network blip, Redis restart, timeout), the listener automatically reconnects with exponential backoff (1s → 2s → 4s → ... → 60s max)
-- **Connection health checks:** The Redis client sends periodic health-check pings (every 15s) to detect stale connections before they cause missed events
-- **Socket timeouts:** Connection and read timeouts prevent the listener from hanging indefinitely on a dead connection
-- **HTTP retries:** Calls to the GCP Cloud Function are retried up to 3 times on transient failures (429, 5xx) with backoff
-- **Graceful shutdown:** Handles SIGTERM/SIGINT signals so Cloud Run revision updates cleanly close the Redis subscription before the container exits
-- **Health-aware endpoint:** The `/health` endpoint returns 503 while Redis is disconnected, allowing Cloud Run to detect and respond to unhealthy instances
+## Updating
+```bash
+# Pull latest changes
+cd /home/$USER/simple-redis-listener
+git pull
 
-### Deployment and Revision Updates
+# Restart service
+sudo systemctl restart redis-listener
+```
 
-When you deploy a new revision:
-1. Cloud Run starts a new container instance with the updated code
-2. The old container receives a termination signal (SIGTERM)
-3. The service catches SIGTERM and cleanly unsubscribes from Redis
-4. The old container has a grace period (default 10 seconds) to shut down gracefully
-5. The new container starts fresh with the new code and new threads
-6. There may be a brief gap (seconds) during the transition where expired keys are not processed
+---
 
-**Best Practice:** Deploy during low-traffic periods to minimize missed expiration events during the transition.
+## Why Compute Engine?
+
+- ✅ **Reliable** - No unexpected platform restarts
+- ✅ **Always-on** - Persistent Redis connection
+- ✅ **Free tier** - $0/month for e2-micro in eligible regions
+- ✅ **Simple** - Basic VM, no containers or orchestration needed
